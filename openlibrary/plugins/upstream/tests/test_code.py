@@ -9,13 +9,18 @@ Covers:
 * the ground-truth availability fallback (only called when bulk
   availability status == "error", only for the selected edition, and
   only exactly once)
-* the resulting lending_state for a few representative ground-truth
-  outcomes
+* the resulting lending_state for representative ground-truth outcomes
+  (open, borrowable, waitlist) plus user-dependent states (borrowed,
+  printdisabled, preview_only, locate)
+* that the already-resolved request user is passed through to
+  get_lending_state() and is not re-resolved via get_current_user()
+* that the ground-truth fallback is applied before lending_state is calculated
 * that LoanStatus.html/get_cached_groundtruth_availability are no longer
-  reachable from template rendering
+  reachable from template rendering, including remaining LoanStatus callers
 * that overriding modes["view"][None] doesn't shadow edit/history/revert/diff
 """
 
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
@@ -211,6 +216,14 @@ class TestPrepareBookPageLendingState:
         page.works = [work]
         return page
 
+    def _page_with_availability(self, availability):
+        ed1 = make_edition("/books/OL1M", ocaid="ia1", availability=availability)
+        work = make_work("/works/OL1W", [ed1])
+        work.works = []
+        page = ed1
+        page.works = [work]
+        return page
+
     def test_bulk_error_groundtruth_open(self):
         page = self._page()
         mock_provider = Mock(short_name="ia")
@@ -275,6 +288,112 @@ class TestPrepareBookPageLendingState:
         mock_gt.assert_not_called()
         assert context.lending_state == "open"
 
+    def test_supplied_user_is_passed_to_get_lending_state(self):
+        page = self._page(bulk_status="open")
+        user = self._user()
+        with patch.object(lending, "get_lending_state", return_value="open") as mock_gls:
+            code.prepare_book_page(page, {}, user=user)
+
+        mock_gls.assert_called_once()
+        assert mock_gls.call_args.kwargs["user"] is user
+        assert mock_gls.call_args.kwargs["check_loan_status"] is True
+
+    def test_logged_out_skips_loan_status_check(self):
+        page = self._page(bulk_status="open")
+        with patch.object(lending, "get_lending_state", return_value="open") as mock_gls:
+            code.prepare_book_page(page, {}, user=None)
+
+        mock_gls.assert_called_once()
+        assert mock_gls.call_args.kwargs["user"] is None
+        assert mock_gls.call_args.kwargs["check_loan_status"] is False
+
+    def test_supplied_user_is_not_re_resolved(self):
+        """prepare_book_page() must pass the already-resolved user through so
+        get_lending_state() does not call get_current_user() again."""
+        page = self._page_with_availability({"is_lendable": True, "available_to_borrow": True})
+        user = self._user()
+        mock_provider = Mock(short_name="ia")
+        with (
+            patch("openlibrary.book_providers.get_book_provider", return_value=mock_provider),
+            patch("openlibrary.accounts.get_current_user") as mock_get_user,
+        ):
+            context = code.prepare_book_page(page, {}, user=user)
+
+        mock_get_user.assert_not_called()
+        user.get_loan_for.assert_called_once_with("ia1", use_cache=True)
+        assert context.lending_state == "borrowable"
+
+    def test_active_loan_borrowed(self):
+        page = self._page_with_availability({"is_lendable": True, "available_to_borrow": True})
+        user = self._user()
+        user.get_loan_for.return_value = {"expiry": "tomorrow"}
+        mock_provider = Mock(short_name="ia")
+        with (
+            patch("openlibrary.book_providers.get_book_provider", return_value=mock_provider),
+            patch("openlibrary.accounts.get_current_user") as mock_get_user,
+        ):
+            context = code.prepare_book_page(page, {}, user=user)
+
+        mock_get_user.assert_not_called()
+        assert context.lending_state == "borrowed"
+
+    def test_print_disabled_user(self):
+        page = self._page_with_availability({"is_lendable": True, "available_to_borrow": True})
+        user = self._user()
+        user.is_printdisabled.return_value = True
+        mock_provider = Mock(short_name="ia")
+        with patch("openlibrary.book_providers.get_book_provider", return_value=mock_provider):
+            context = code.prepare_book_page(page, {}, user=user)
+
+        assert context.lending_state == "printdisabled"
+
+    def test_preview_only(self):
+        page = self._page_with_availability({"is_previewable": True})
+        user = self._user()
+        mock_provider = Mock(short_name="ia")
+        with patch("openlibrary.book_providers.get_book_provider", return_value=mock_provider):
+            context = code.prepare_book_page(page, {}, user=user)
+
+        assert context.lending_state == "preview_only"
+
+    def test_locate_when_no_usable_availability(self):
+        page = self._page_with_availability({})
+        user = self._user()
+        mock_provider = Mock(short_name="ia")
+        with patch("openlibrary.book_providers.get_book_provider", return_value=mock_provider):
+            context = code.prepare_book_page(page, {}, user=user)
+
+        assert context.lending_state == "locate"
+
+    def test_fallback_is_applied_before_lending_state(self):
+        """bulk error -> ground-truth open must be visible on the edition
+        at the moment get_lending_state() runs, so the final lending_state
+        reflects the fallback rather than the bulk error."""
+        page = self._page()
+        seen = {}
+        real_gls = lending.get_lending_state
+
+        def spy(doc, user=None, check_loan_status=False):
+            availability = doc.availability if hasattr(doc, "availability") else doc.get("availability", {})
+            seen["availability"] = dict(availability)
+            return real_gls(doc, user=user, check_loan_status=check_loan_status)
+
+        mock_provider = Mock(short_name="ia")
+        with (
+            patch.object(
+                lending,
+                "get_cached_groundtruth_availability",
+                return_value={"status": "open", "is_readable": True},
+            ),
+            patch.object(lending, "get_lending_state", side_effect=spy),
+            patch("openlibrary.book_providers.get_book_provider", return_value=mock_provider),
+        ):
+            context = code.prepare_book_page(page, {}, user=self._user())
+
+        assert seen["availability"]["status"] == "open"
+        assert seen["availability"]["is_readable"] is True
+        assert context.lending_state == "open"
+
 
 class TestLoanStatusNoLongerDoesNetworkIO:
     """Section D: no template can reach the ground-truth availability fetch anymore."""
@@ -301,6 +420,31 @@ class TestLoanStatusNoLongerDoesNetworkIO:
         # Still a normal, cached, importable Python function -- just not
         # exposed to Templetor anymore.
         assert callable(lending.get_cached_groundtruth_availability)
+
+    def test_no_template_calls_groundtruth_availability(self):
+        """Invariant: no remaining template/macro performs the ground-truth
+        availability HTTP request. Search, carousel, edition-sort, and
+        account/loans all render already-prepared availability."""
+        offenders = []
+        for root in (Path("openlibrary/macros"), Path("openlibrary/templates")):
+            for path in root.rglob("*.html"):
+                source = path.read_text()
+                if "get_cached_groundtruth_availability" in source or "allow_expensive_availability_check" in source:
+                    offenders.append(str(path))
+        assert offenders == []
+
+    def test_remaining_loan_status_callers_do_not_request_groundtruth(self):
+        callers = [
+            "openlibrary/macros/SearchResultsWork.html",
+            "openlibrary/macros/databarWork.html",
+            "openlibrary/templates/books/edition-sort.html",
+            "openlibrary/templates/books/custom_carousel_card.html",
+            "openlibrary/templates/account/loans.html",
+        ]
+        for path in callers:
+            source = Path(path).read_text()
+            assert "get_cached_groundtruth_availability" not in source
+            assert "allow_expensive_availability_check" not in source
 
 
 class TestViewModeRoutingIsolation:
@@ -401,6 +545,29 @@ class TestViewModeRoutingIsolation:
         assert mock_prepare.call_args[0][0] is work_page
         assert mock_prepare.call_args[0][2] is fake_user
         mock_render.assert_called_once_with(work_page, book_page_context=fake_context)
+
+    def test_view_class_reuses_web_input(self, monkeypatch):
+        """view.GET() must not call web.input() twice; the already-read
+        request object is passed through to prepare_book_page()."""
+        captured = {"calls": 0, "result": None}
+
+        def fake_input(*a, **kw):
+            captured["calls"] += 1
+            captured["result"] = web.storage(v=None)
+            return captured["result"]
+
+        monkeypatch.setattr(web, "input", fake_input)
+        work_page = web.storage(key="/works/OL1W", type=web.storage(key="/type/work"))
+        monkeypatch.setattr(code.context, "user", None, raising=False)
+        monkeypatch.setattr(code.render, "viewpage", Mock(return_value="rendered"), raising=False)
+        with (
+            patch.object(code.core.db, "get_version", return_value=work_page),
+            patch.object(code, "prepare_book_page", return_value=object()) as mock_prepare,
+        ):
+            code.view().GET("/works/OL1W")
+
+        assert captured["calls"] == 1
+        assert mock_prepare.call_args[0][1] is captured["result"]
 
     def test_view_class_does_not_call_get_user_itself(self, monkeypatch):
         """Regression test: view.GET() must not call web.ctx.site.get_user()

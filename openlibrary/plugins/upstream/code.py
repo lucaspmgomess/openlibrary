@@ -122,7 +122,7 @@ class view(core.view):
         # templates see as ctx.user) instead of calling
         # web.ctx.site.get_user() again here: that method is not memoized
         # and makes a real Infobase round-trip every time it's called.
-        book_page_context = prepare_book_page(p, web.input(), context.user)
+        book_page_context = prepare_book_page(p, i, context.user)
         return render.viewpage(p, book_page_context=book_page_context)
 
 
@@ -330,7 +330,7 @@ def prepare_book_page(page, query_params, user=None) -> BookPageContext:
 
     :param page: the Work or Edition already loaded for this request.
     :param query_params: a mapping supporting `.get(name, default)`, e.g. `web.input()`.
-    :param user: the logged-in user, if any (only used to gate loan/waitlist checks).
+    :param user: the logged-in user, if any. Passed through to get_lending_state so it is not re-resolved.
     """
     show_observations = True
 
@@ -420,7 +420,11 @@ def prepare_book_page(page, query_params, user=None) -> BookPageContext:
     if edition.get("availability", {}).get("status") == "error" and ocaid:
         edition["availability"].update(lending.get_cached_groundtruth_availability(ocaid))
 
-    lending_state = lending.get_lending_state(edition or work, check_loan_status=bool(user))
+    lending_state = lending.get_lending_state(
+        edition or work,
+        user=user,
+        check_loan_status=bool(user),
+    )
 
     return BookPageContext(
         work=work,
