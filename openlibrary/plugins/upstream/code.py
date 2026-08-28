@@ -7,6 +7,8 @@ import json
 import os.path
 import random
 import re
+from dataclasses import dataclass
+from typing import Any
 
 import web
 
@@ -16,7 +18,7 @@ from infogami.infobase import client
 from infogami.plugins.api.code import jsonapi, make_query
 from infogami.plugins.api.code import request as infogami_request
 from infogami.utils import delegate
-from infogami.utils.context import context  # noqa: F401 side effects may be needed
+from infogami.utils.context import context
 from infogami.utils.view import (
     public,
     render,
@@ -24,6 +26,7 @@ from infogami.utils.view import (
     safeint,
 )
 from openlibrary import accounts  # noqa: F401 side effects may be needed
+from openlibrary.core import lending
 from openlibrary.plugins.upstream import (
     addbook,
     addtag,
@@ -84,6 +87,31 @@ class edit(core.edit):
         if re.compile("/(people/[^/]+)").match(key) and spamcheck.is_spam():
             return render_template("message.html", "Oops", "Something went wrong. Please try again later.")
         return core.edit.POST(self, key)
+
+
+class view(core.view):
+    """Prepare lending/availability in Python for /works and /books HTML views.
+
+    Other types and modes/encodings continue through their existing handlers.
+    """
+
+    def GET(self, path):
+        # Everything else goes through core.view unchanged, without the
+        # redundant get_version() load below.
+        if not path.startswith(("/works/", "/books/")):
+            return core.view.GET(self, path)
+
+        i = web.input(v=None)
+        if i.v is not None and safeint(i.v, None) is None:
+            raise web.seeother(web.changequery(v=None))
+
+        p = core.db.get_version(path, i.v)
+        if p is None or p.type.key not in ("/type/work", "/type/edition"):
+            return core.view.GET(self, path)
+
+        # context.user avoids a second, non-memoized get_user() round-trip.
+        book_page_context = prepare_book_page(p, i, context.user)
+        return render.viewpage(p, book_page_context)
 
 
 # handlers for change photo and change cover
@@ -257,6 +285,137 @@ def get_document(key, limit_redirs=5):
         else:
             return doc
     return doc
+
+
+@dataclass
+class BookPageContext:
+    """Data needed to render a /works or /books page, prepared in Python
+    before the template renders so that no lending/availability I/O
+    (including the ground-truth availability fallback) happens from
+    inside a template.
+    """
+
+    work: Any
+    edition: Any
+    editions: list
+    editions_limit: int | None
+    previews: list
+    show_observations: bool
+    lending_state: str
+
+
+def prepare_book_page(page, query_params, user=None) -> BookPageContext:
+    """Resolves the work, selected edition, and lending state for a /works
+    or /books page. Ported from type/edition/view.html so that no
+    lending/availability I/O (including the ground-truth fallback) happens
+    from inside a template.
+
+    :param page: the Work or Edition already loaded for this request.
+    :param query_params: a mapping supporting `.get(name, default)`, e.g. `web.input()`.
+    :param user: the logged-in user, if any (only used to gate loan/waitlist checks).
+    """
+    import openlibrary.book_providers as bp
+
+    show_observations = True
+
+    if page.key.startswith("/works"):
+        work = page
+    elif page.works:
+        work = next(iter(page.works))
+    else:
+        work = page.make_work_from_orphaned_edition()
+        show_observations = False
+
+    # This can happen when looking at past versions of an edition whose
+    # work has since been merged.
+    if work.type.key == "/type/redirect":
+        redir = work
+        work = get_document(redir.key)
+        work["title"] = "↪ " + redir.key
+
+    edition = web.storage({})
+    if query_params.get("edition", "").startswith("key:"):
+        edition = core.db.get_type(query_params.get("edition").split(":")[1])
+    elif page.key.startswith("/books"):
+        # We are on an editions page: an edition has been explicitly selected
+        edition = page
+
+    selected_id = None
+    provider = None
+    if query_params.get("edition") and not edition:
+        if ":" in query_params.get("edition"):
+            selected_provider, selected_id = query_params.get("edition").split(":")
+        else:
+            selected_provider, selected_id = "ia", query_params.get("edition")
+        provider = bp.get_book_provider_by_name(selected_provider)
+
+    # Fetch a work's editions.
+    # Book availability of editions injected by bulk get_availability API.
+    edition_count = work.edition_count if work and work.edition_count else 1
+    mode = query_params.get("mode")
+    ebooks_only = (mode == "ebooks") or (mode != "all" and edition_count > 10)
+
+    # For performance reasons, limit to 10 ebooks.
+    # Tradeoff: limits our ability to select best edition.
+    editions_limit = None if mode in ("all", "ebooks") else 10
+    # keys ensures the current edition we're on or requested edition are fetched by get_sorted_editions
+    if edition:
+        keys = [edition.key]
+    elif provider:
+        # provider is only ever set alongside selected_id, above.
+        assert selected_id is not None
+        keys = provider.get_olids(selected_id)
+    else:
+        keys = None
+
+    editions = []
+    if ebooks_only:
+        editions = work.get_sorted_editions(ebooks_only=ebooks_only, limit=editions_limit, keys=keys)
+    if not editions:
+        editions = work.get_sorted_editions(limit=editions_limit, keys=keys)
+    availabilities = {e.availability.get("identifier"): e.availability for e in editions}
+
+    previews = [e for e in editions if e.get("ocaid")]
+
+    # No edition selected yet: pick one (matching the requested provider/id, else the default best edition)
+    if editions and not edition:
+        if provider:
+            edition = next((e for e in editions if selected_id in provider.get_identifiers(e)), editions[0])
+        else:
+            edition, provider = bp.get_best_edition(editions)
+
+    # Just in case edition is not set, treat as work
+    edition = edition or page
+
+    if not edition.get("availability"):
+        edition["availability"] = (edition.get("ocaid") and availabilities.get(edition["ocaid"])) or {}
+
+    # Ground-truth fallback: only for the selected edition, only when bulk availability errored.
+    ocaid = edition.get("ocaid")
+    if edition.get("availability", {}).get("status") == "error" and ocaid:
+        try:
+            edition["availability"].update(lending.get_cached_groundtruth_availability(ocaid))
+        except Exception:
+            # Unlike the old template-side call (caught by Templetor's
+            # saferender()), an uncaught exception here would 500 the whole
+            # page. Keep the bulk ("error") availability instead.
+            logger.exception("get_cached_groundtruth_availability(%r) failed; keeping bulk availability", ocaid)
+
+    lending_state = lending.get_lending_state(
+        edition or work,
+        user=user,
+        check_loan_status=bool(user),
+    )
+
+    return BookPageContext(
+        work=work,
+        edition=edition,
+        editions=editions,
+        editions_limit=editions_limit,
+        previews=previews,
+        show_observations=show_observations,
+        lending_state=lending_state,
+    )
 
 
 class revert(delegate.mode):
